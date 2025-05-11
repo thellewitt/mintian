@@ -1,4 +1,3 @@
-# XFCE4-Terminal Dynamic Color Theme Script
 
 ## Overview
 
@@ -6,60 +5,69 @@ This Bash script dynamically changes the color theme of the XFCE4 Terminal. It g
 
 The script is designed to provide an aesthetically pleasing and accessible terminal experience with every new terminal window or tab.
 
-## Features
+---
 
-* **Dynamic Color Generation:** Generates random hexadecimal color codes for the terminal background and foreground.
-* **WCAG 2.0 Contrast Compliance:** Ensures that the generated foreground text color has sufficient contrast against the background color, adhering to the WCAG 2.0 AA contrast ratio of at least 4.5:1 for normal text.
-* **Tab-Specific Backgrounds:** Applies a unique random background color to each open tab in the terminal.
-* **Customizable Contrast Threshold:** Allows users to specify the minimum contrast ratio via a command-line argument.
-* **Loop Prevention:** Includes a maximum attempt counter to prevent infinite loops when searching for a compliant color combination.
-* **Color Palette Generation:** Generates a diverse 16-color palette for the terminal.
-* **Efficient Luminance Calculation:** Uses optimized `awk` for calculating color luminance.
-* **Caching:** Implements caching for luminance values to improve performance.
-* **Notifications (Optional):** Can send desktop notifications upon theme and tab color changes (requires `notify-send`).
+## ✨ Features
 
-## Usage
+- **Dynamic Color Generation** – Random hex color codes for background and foreground.
+- **WCAG 2.0 Contrast Compliance** – Ensures at least a 4.5:1 contrast ratio (AA standard).
+- **Unique Per Tab** – Each open tab can have its own unique background.
+- **Customizable Contrast Threshold** – User-defined minimum contrast via CLI.
+- **Loop Prevention** – Maximum attempt count to avoid infinite loops.
+- **Full 16-Color Palette** – Generates and applies a custom palette.
+- **Optimized Luminance Calculation** – Uses efficient `awk` math.
+- **Luminance Caching** – Reduces redundant calculations.
+- **Desktop Notifications** – Optional `notify-send` alerts when themes change.
 
-1.  **Save the Script:** Save the script to a file, for example, `xfce4-color-change.sh`.
-2.  **Make it Executable:** Open a terminal and run:
-    ```bash
-    chmod +x xfce4-color-change.sh
-    ```
-3.  **Run the Script:** Execute the script. This is typically done when launching a new XFCE4 Terminal window or tab by piping the output to `xfce4-terminal`:
-    ```bash
+---
+
+## 🧪 Usage
+
+1. **Save the Script**  
+   Save the file as `xfce4-color-change.sh`.
+
+2. **Make it Executable**
+   ```bash
+   chmod +x xfce4-color-change.sh
+
+    Run the Script
+    Pipe it into xfce4-terminal:
+
     ./xfce4-color-change.sh | xfce4-terminal
-    ```
-    You can also set this as the command to run when opening a new terminal in your XFCE4 settings.
 
-### Command-Line Arguments
+    Auto-run on Terminal Launch
+    Set this script in your XFCE4 terminal’s launch command (under Preferences > General).
 
-* `${1:-7.0}`: (Optional) Specifies the minimum contrast ratio. Defaults to `7.0` (WCAG 2.0 AAA for enhanced contrast).
-* `${2:-50}`: (Optional) Specifies the maximum number of attempts to find a compliant color combination. Defaults to `50`.
+🛠️ Command-Line Arguments
+Argument	Description	Default
+${1}	Minimum contrast ratio (e.g., 5.0 for AA, 7.0 for AAA)	7.0
+${2}	Max attempts to find a compliant color combo	50
 
-**Example:**
+Example:
 
-To run the script with a contrast threshold of 5.0:
-
-```bash
 ./xfce4-color-change.sh 5.0 | xfce4-terminal
 
-Requirements:
+📦 Requirements
 
     bash
-    xfconf-query (part of the XFCE desktop environment)
+
+    xfconf-query (XFCE environment)
+
     awk
-    notify-send (optional, for desktop notifications)
 
-Installation:
+    notify-send (optional)
 
-No specific installation is required. Simply save the script and make it executable.
+🔧 Configuration
 
-Configuration:
+No formal installation needed. Save the script, make it executable, and run it. You can tweak the contrast threshold or max attempts via CLI args.
+🤝 Contributing
 
-The main configuration options are available as command-line arguments (contrast threshold and maximum attempts). You can adjust these values to your preference.
-Contributing
-
-Feel free to fork this repository and submit pull requests for any improvements or bug fixes.
+Pull requests welcome!
+Feel free to fork and submit improvements, ideas, bug fixes, or translations.
 
     Inspired by the desire for a dynamic and accessible terminal color scheme.
-    Utilizes the WCAG 2.0 guidelines for color contrast.
+    Based on WCAG 2.0 color contrast guidelines for inclusivity and readability.
+
+🪪 License
+
+This script is released into the public domain. You are free to use, modify, distribute, and share it as you wish—no attribution required, but always appreciated.
