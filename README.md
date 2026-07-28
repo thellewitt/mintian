@@ -1,73 +1,107 @@
+# XFCE4 Color Change Script v3.1
 
-## Overview
+## Mirror Edition — Precision Cached Luminance
 
-This Bash script dynamically changes the color theme of the XFCE4 Terminal. It generates random background and foreground colors, ensuring they meet the Web Content Accessibility Guidelines (WCAG) 2.0 contrast ratio for readability. Additionally, it applies a unique random background color to each open tab.
+A lightweight Bash utility for generating dynamic XFCE4-Terminal color themes with automatic contrast handling, palette generation, and color personality detection.
 
-The script is designed to provide an aesthetically pleasing and accessible terminal experience with every new terminal window or tab.
+Originally developed as part of the **XFCE4-Terminal Mirror**, this standalone edition brings the color engine into a simple script that can be used independently.
 
----
+## Features
 
-## ✨ Features
+* 🎨 Generates unique terminal color themes on demand
+* 🌈 Detects the generated palette's color character:
 
-- **Dynamic Color Generation** – Random hex color codes for background and foreground.
-- **WCAG 2.0 Contrast Compliance** – Ensures at least a 4.5:1 contrast ratio (AA standard).
-- **Unique Per Tab** – Each open tab can have its own unique background.
-- **Customizable Contrast Threshold** – User-defined minimum contrast via CLI.
-- **Loop Prevention** – Maximum attempt count to avoid infinite loops.
-- **Full 16-Color Palette** – Generates and applies a custom palette.
-- **Optimized Luminance Calculation** – Uses efficient `awk` math.
-- **Luminance Caching** – Reduces redundant calculations.
-- **Desktop Notifications** – Optional `notify-send` alerts when themes change.
+  * `ember` — reds and crimson tones
+  * `solar` — oranges and yellows
+  * `warm` — yellow-green tones
+  * `cool` — greens and teals
+  * `frost` — cyan and blue tones
+  * `lunar` — purples, pinks, and magentas
+  * `void` — rare near-black palettes
+* 💡 Calculates luminance and enforces readable foreground/background contrast
+* 🧮 Uses cached luminance calculations for faster repeated generation
+* 🔄 Maintains palette history to avoid immediate repeats
+* 🌬️ Includes a subtle palette breathing animation after theme generation
+* 🔔 Optional desktop notification support
 
----
+## Requirements
 
-## 🧪 Usage
+* Bash
+* XFCE4-Terminal
+* `xfconf-query`
+* `awk`
+* Optional:
 
-1. **Save the Script**  
-   Save the file as `xfce4-color-change.sh`.
+  * `notify-send` for desktop notifications
 
-2. **Make it Executable**
-   ```bash
-   chmod +x xfce4-color-change.sh
+## Installation
 
-    Run the Script
-    Pipe it into xfce4-terminal:
+Make the script executable:
 
-    ./xfce4-color-change.sh | xfce4-terminal
+```bash
+chmod +x xfce4-color-change-v3.1.sh
+```
 
-    Auto-run on Terminal Launch
-    Set this script in your XFCE4 terminal’s launch command (under Preferences > General).
+Run:
 
-🛠️ Command-Line Arguments
-Argument	Description	Default
-${1}	Minimum contrast ratio (e.g., 5.0 for AA, 7.0 for AAA)	7.0
-${2}	Max attempts to find a compliant color combo	50
+```bash
+./xfce4-color-change-v3.1.sh
+```
+
+The script will generate a new terminal theme and apply it immediately.
+
+## Options
+
+The script accepts optional parameters:
+
+```bash
+./xfce4-color-change-v3.1.sh [contrast_threshold] [max_attempts]
+```
 
 Example:
 
-./xfce4-color-change.sh 5.0 | xfce4-terminal
+```bash
+./xfce4-color-change-v3.1.sh 7 100
+```
 
-📦 Requirements
+Where:
 
-    bash
+* `contrast_threshold` controls the minimum WCAG-style contrast ratio
+* `max_attempts` controls how many attempts are made when searching for a readable foreground color
 
-    xfconf-query (XFCE environment)
+Defaults:
 
-    awk
+```text
+contrast_threshold = 4.5
+max_attempts       = 50
+```
 
-    notify-send (optional)
+## Example Output
 
-🔧 Configuration
+```text
+Mirror Aura: frost * ~ *
+BG:          #4b6f71
+FG:          #f3f9ff
+```
 
-No formal installation needed. Save the script, make it executable, and run it. You can tweak the contrast threshold or max attempts via CLI args.
-🤝 Contributing
+## Design Notes
 
-Pull requests welcome!
-Feel free to fork and submit improvements, ideas, bug fixes, or translations.
+The color engine does not simply choose random colors. Generated palettes are processed through luminance analysis, contrast correction, hue classification, and polarity control to keep the result both visually interesting and usable.
 
-    Inspired by the desire for a dynamic and accessible terminal color scheme.
-    Based on WCAG 2.0 color contrast guidelines for inclusivity and readability.
+The goal is a terminal theme that feels discovered rather than assigned.
 
-🪪 License
+## Version History
 
-This script is released into the public domain. You are free to use, modify, distribute, and share it as you wish—no attribution required, but always appreciated.
+### v3.1 — Precision Cached Luminance Edition
+
+* Added luminance caching
+* Improved contrast handling
+* Added palette history tracking
+* Added Mirror Aura hue classification
+* Improved generated palette polarity
+* Added background breathing animation
+* Extracted from the XFCE4-Terminal Mirror engine
+
+## License
+
+Released as part of the Mintian utility collection.
