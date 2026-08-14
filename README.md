@@ -104,4 +104,4 @@ The goal is a terminal theme that feels discovered rather than assigned.
 
 ## License
 
-Released as part of the Mintian utility collection.
+Released as part of the Mintian Utilities collection.
