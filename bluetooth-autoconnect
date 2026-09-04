@@ -1,0 +1,747 @@
+#!/usr/bin/env python3
+
+import faulthandler
+faulthandler.enable()
+
+import sys
+import signal
+import getopt
+import json
+import subprocess
+import dbus
+import dbus.service
+import gi
+
+gi.require_version("Wp", "0.5")
+
+from dbus.mainloop.glib import DBusGMainLoop
+from gi.repository import GLib, Wp, GLibUnix
+
+# ---------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------
+DEFAULT_VOLUME = 0.65
+
+RSSI_THRESHOLD = -85
+RECOVERY_THRESHOLD = -75
+
+VERBOSE = False
+DAEMON = False
+
+AGENT_INTERFACE = "org.bluez.Agent1"
+AGENT_PATH = "/test/agent"
+
+# ---------------------------------------------------------
+# Runtime Main Loops
+# ---------------------------------------------------------
+loop = GLib.MainLoop()
+bus = None
+
+pending_connections = set()
+
+# ---------------------------------------------------------
+# Logging
+# ---------------------------------------------------------
+def log(*msg):
+    if VERBOSE:
+        print(*msg)
+
+# ---------------------------------------------------------
+# Bluetooth Device Model
+# ---------------------------------------------------------
+class Device:
+    def __init__(self, path):
+        self.path = path
+        self.alias = None
+        self.connected = False
+        self.trusted = False
+        self.rssi = None
+        self.unstable = False
+        self.removed = False
+        self.sync_timer_id = None
+        self.sync_retries = 0
+
+    def cancel_sync_timer(self):
+        if self.sync_timer_id is not None:
+            GLib.source_remove(self.sync_timer_id)
+            self.sync_timer_id = None
+
+    def update(self, props):
+        if "Alias" in props:
+            self.alias = str(props["Alias"])
+
+        if "Trusted" in props:
+            self.trusted = bool(props["Trusted"])
+
+        if "Connected" in props:
+            self._handle_connection(bool(props["Connected"]))
+
+        if "RSSI" in props:
+            self._handle_rssi(int(props["RSSI"]))
+
+    def _handle_connection(self, state):
+        self.connected = state
+        self.cancel_sync_timer()  # Always clear pending timers on state change
+
+        if state:
+            log("Connected:", self.alias)
+            self.sync_retries = 0
+
+            def delayed():
+                self.sync_timer_id = None
+                # Abort if state changed while waiting
+                if not self.removed and self.connected:
+                    AudioManager.sync_device(self)
+                return False
+
+            self.sync_timer_id = GLib.timeout_add_seconds(2, delayed)
+        else:
+            log("Disconnected:", self.alias)
+            self.unstable = False
+            self.sync_retries = 0
+
+    def _handle_rssi(self, value):
+        self.rssi = value
+        if not self.connected or value >= 0:
+            return
+
+        if value < RSSI_THRESHOLD and not self.unstable:
+            self.unstable = True
+            log("⚠️ RSSI Critical:", self.alias, f"({value} dBm)")
+            AudioManager.prepare_failover(self)
+
+        elif value > RECOVERY_THRESHOLD and self.unstable:
+            self.unstable = False
+            log("✅ RSSI Restored:", self.alias, f"({value} dBm)")
+
+            # Use the same timer logic for RSSI restoration
+            self.cancel_sync_timer()
+            def delayed_rssi():
+                self.sync_timer_id = None
+                if not self.removed and self.connected:
+                    AudioManager.sync_device(self)
+                return False
+            self.sync_timer_id = GLib.timeout_add_seconds(2, delayed_rssi)
+
+# ---------------------------------------------------------
+# Bluetooth Registry
+# ---------------------------------------------------------
+class DeviceRegistry:
+    _registry = {}
+
+    @classmethod
+    def get(cls, path):
+        if path not in cls._registry:
+            cls._registry[path] = Device(path)
+        return cls._registry[path]
+
+    @classmethod
+    def all(cls):
+        return cls._registry.values()
+
+    @classmethod
+    def remove(cls, path):
+        """Removes a device from the registry and cleans up its state."""
+        if path in cls._registry:
+            device = cls._registry.pop(path)
+            device.removed = True
+            device.cancel_sync_timer()
+            log("🧹 Cleaned up removed BlueZ device:", device.alias or path)
+
+            pending_connections.discard(path)
+
+# ---------------------------------------------------------
+# WirePlumber Graph Manager
+# ---------------------------------------------------------
+class GraphManager:
+    def __init__(self):
+        Wp.init(Wp.InitFlags.ALL)
+
+        self.core = Wp.Core.new(GLib.MainContext.default(), None)
+        self.om = Wp.ObjectManager.new()
+
+        self.nodes = {}
+        self.devices = {}
+        self.metadata = {}
+        self._configure_interests()
+
+    def _configure_interests(self):
+        # 1. Physical Audio Sinks
+        sink_interest = Wp.ObjectInterest.new_type(Wp.Node.__gtype__)
+        sink_interest.add_constraint(
+            Wp.ConstraintType.PW_PROPERTY,
+            "media.class",
+            Wp.ConstraintVerb.EQUALS,
+            GLib.Variant.new_string("Audio/Sink")
+        )
+        self.om.add_interest_full(sink_interest)
+
+        # 2. Playback Streams
+        stream_interest = Wp.ObjectInterest.new_type(Wp.Node.__gtype__)
+        stream_interest.add_constraint(
+            Wp.ConstraintType.PW_PROPERTY,
+            "media.class",
+            Wp.ConstraintVerb.EQUALS,
+            GLib.Variant.new_string("Stream/Output/Audio")
+        )
+        self.om.add_interest_full(stream_interest)
+
+        # 3. Devices (unfiltered)
+        device_interest = Wp.ObjectInterest.new_type(Wp.Device.__gtype__)
+        self.om.add_interest_full(device_interest)
+
+        # 4. Metadata (unfiltered)
+        metadata_interest = Wp.ObjectInterest.new_type(Wp.Metadata.__gtype__)
+        self.om.add_interest_full(metadata_interest)
+
+    def activate(self):
+        ok = self.core.connect()
+        if not ok:
+            log("❌ Failed to start PipeWire connection")
+            return
+
+        GLib.timeout_add(100, self._poll_core_ready)
+
+    def _poll_core_ready(self):
+        if self.core.is_connected():
+            log("🔌 WirePlumber Core connected")
+
+            node_features = (
+                Wp.ProxyFeatures.PIPEWIRE_OBJECT_FEATURE_INFO |
+                Wp.ProxyFeatures.PIPEWIRE_OBJECT_FEATURE_PARAM_PROPS
+            )
+
+            device_features = (
+                Wp.ProxyFeatures.PIPEWIRE_OBJECT_FEATURE_INFO |
+                Wp.ProxyFeatures.PIPEWIRE_OBJECT_FEATURE_PARAM_PROFILE |
+                Wp.ProxyFeatures.PIPEWIRE_OBJECT_FEATURE_PARAM_ROUTE
+            )
+
+            self.om.request_object_features(Wp.Node, node_features)
+            self.om.request_object_features(Wp.Device, device_features)
+            self.om.request_object_features(Wp.Metadata, Wp.ProxyFeatures.PIPEWIRE_OBJECT_FEATURE_INFO)
+
+            self.om.connect("object-added", self._on_object_added)
+            self.om.connect("object-removed", self._on_object_removed)
+            self.core.install_object_manager(self.om)
+            return False
+        return True
+
+    def _on_object_added(self, om, obj):
+        try:
+            oid = obj.get_id()
+            if isinstance(obj, Wp.Node):
+                self.nodes[oid] = obj
+                props = obj.get_property("properties")
+                media_class = props.get("media.class") if props else "Unknown"
+                node_name = props.get("node.name") if props else "Pending"
+                log(f"🟢 Graph node added: [{oid}] {media_class} -> {node_name}")
+            elif isinstance(obj, Wp.Device):
+                self.devices[oid] = obj
+                log(f"🎛️ Graph device added: [{oid}]")
+            elif isinstance(obj, Wp.Metadata):
+                self.metadata[oid] = obj
+                log(f"ℹ️ Metadata block initialized: [{oid}]")
+        except Exception as e:
+            log(f"❌ Object handling failure: {e}")
+
+    def _on_object_removed(self, om, obj):
+        try:
+            oid = obj.get_id()
+            if isinstance(obj, Wp.Node):
+                self.nodes.pop(oid, None)
+                log(f"🔴 Graph node removed: {oid}")
+            elif isinstance(obj, Wp.Device):
+                self.devices.pop(oid, None)
+                log(f"🗑️ Graph device removed: {oid}")
+            elif isinstance(obj, Wp.Metadata):
+                self.metadata.pop(oid, None)
+                log(f"ℹ️ Metadata block removed: {oid}")
+        except Exception as e:
+            log(f"❌ Removal tracking failure: {e}")
+
+    def find_bluetooth_sink(self, alias):
+        """Refined matching: Checks multiple fields and ignores case safely."""
+        if not alias: return None
+        alias_lower = alias.lower()
+
+        for node in self.nodes.values():
+            props = node.get_property("properties")
+            if not props:
+                continue
+            if not props.get("device.id"):
+                continue
+
+            if "Monitor" in (props.get("media.class") or ""):
+                continue
+
+            desc = props.get("node.description") or ""
+            nick = props.get("node.nick") or ""
+            dev_desc = props.get("device.description") or ""
+
+            search_string = f"{desc} {nick} {dev_desc}".lower()
+
+            if alias_lower in search_string:
+                return node
+        return None
+
+    def find_default_metadata(self):
+        for meta in self.metadata.values():
+            props = meta.get_global_properties() if hasattr(meta, 'get_global_properties') else meta.get_properties()
+            if props and props.get("metadata.name") == "default":
+                return meta
+        return None
+
+    def list_audio_streams(self):
+        streams = []
+        for n in self.nodes.values():
+            props = n.get_property("properties")
+            if not props:
+                continue
+            if props.get("media.class") == "Stream/Output/Audio":
+                streams.append(n)
+        return streams
+
+# ---------------------------------------------------------
+# Audio Policy Engine
+# ---------------------------------------------------------
+class AudioPolicy:
+    PROFILE_RANKING = [
+        ("a2dp-sink", "ldac"),
+        ("a2dp-sink", "aptx-hd"),
+        ("a2dp-sink", "aptx"),
+        ("a2dp-sink", "aac"),
+        ("a2dp-sink", "sbc-xq"),
+        ("a2dp-sink", "sbc"),
+        ("headset-head-unit", "msbc"),
+        ("headset-head-unit", "cvsd"),
+    ]
+
+    @classmethod
+    def choose_profile(cls, available_codecs):
+        for profile, codec in cls.PROFILE_RANKING:
+            if codec in available_codecs:
+                return profile, codec
+        return None, None
+
+# ---------------------------------------------------------
+# Native Audio Manager
+# ---------------------------------------------------------
+class AudioManager:
+    graph = None
+
+    @classmethod
+    def initialize(cls):
+        cls.graph = GraphManager()
+        cls.graph.activate()
+
+    @classmethod
+    def sync_device(cls, device):
+        # Double-check state before proceeding
+        if not device.alias or device.removed or not device.connected:
+            return
+
+        sink = cls.graph.find_bluetooth_sink(device.alias)
+        if not sink:
+            if device.sync_retries >= 5:
+                log(f"Unable to locate sink for {device.alias}")
+                device.sync_retries = 0
+                return
+
+            device.sync_retries += 1
+            log(f"Waiting for native graph sink: {device.alias} (retry {device.sync_retries})")
+
+            def retry_sync():
+                device.sync_timer_id = None
+                if not device.removed and device.connected:
+                    cls.sync_device(device)
+                return False
+
+            device.sync_timer_id = GLib.timeout_add_seconds(2, retry_sync)
+            return
+
+        # Defensively clear timers and retries once the sink is successfully located
+        device.cancel_sync_timer()
+        device.sync_retries = 0
+
+        props = sink.get_property("properties")
+
+        if not props:
+            log("Sink properties empty during sync pass")
+            return
+
+        node_name = props.get("node.name")
+
+        # Natively Set Default Sink via Subprocess
+        if node_name:
+            try:
+                subprocess.run([
+                    "pw-metadata", "-n", "settings", "0",
+                    "default.audio.sink", node_name
+                ], check=True, capture_output=True)
+                log(f"⭐ Successfully assigned default system sink → {node_name}")
+            except Exception as e:
+                log(f"Failed to assign default sink via pw-metadata: {e}")
+
+        # Set volume on the selected sink
+        def apply_volume_with_retry(attempt=1):
+            try:
+                # Ensure the graph has finished instantiating the new node post-profile-switch
+                current_sink = cls.graph.find_bluetooth_sink(device.alias)
+                if not current_sink:
+                    raise RuntimeError("Bluetooth sink node still re-initializing")
+
+                log(f"🔊 Setting volume on default sink target for {device.alias}")
+
+                subprocess.run(
+                    ["wpctl", "set-volume", "@DEFAULT_SINK@", str(DEFAULT_VOLUME)],
+                    check=True,
+                    capture_output=True
+                )
+
+                log(
+                    f"🔊 Volume locked to standard profile: "
+                    f"{int(DEFAULT_VOLUME * 100)}%"
+                )
+
+            except (subprocess.CalledProcessError, RuntimeError) as e:
+                if attempt < 4:
+                    log(f"⏳ Volume adjustment waiting for node stabilization (attempt {attempt}/4)...")
+                    GLib.timeout_add(1000, lambda: apply_volume_with_retry(attempt + 1))
+                else:
+                    log(f"❌ Failed to apply volume parameter optimization after retries: {e}")
+
+            except Exception as e:
+                log(f"❌ Unexpected volume optimization error: {e}")
+
+            return False
+
+        # Trigger Profile Policy Enforcement
+        cls._optimize_bluetooth_hardware(sink, device.alias)
+        # Kick off volume adjustment after a brief cushion
+        GLib.timeout_add(1500, lambda: apply_volume_with_retry())
+
+    @classmethod
+    def _optimize_bluetooth_hardware(cls, sink, alias):
+        props = sink.get_property("properties")
+        if not props or not props.get("device.id"):
+            return
+
+        device_id = int(props.get("device.id"))
+
+        try:
+            # Ask PipeWire for the device's capabilities.
+            dump_result = subprocess.run(
+                ["pw-dump", str(device_id)],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+
+            device_data = json.loads(dump_result.stdout)
+
+            if not device_data:
+                log(f"⚠️ Could not dump device data for {alias}")
+                return
+
+            # Extract available profile names from EnumProfile.
+            supported_profiles = []
+
+            info = device_data[0].get("info", {})
+            params = info.get("params", {})
+            enum_profiles = params.get("EnumProfile", [])
+
+            for profile in enum_profiles:
+                prof_name = profile.get("name")
+                available = profile.get("available")
+
+                if not prof_name:
+                    continue
+
+                # Accept the forms commonly emitted by PipeWire JSON.
+                if available in ("no", 0, False):
+                    continue
+
+                supported_profiles.append(prof_name)
+
+            log(f"🔎 Supported profiles for {alias}: {supported_profiles}")
+
+            if not supported_profiles:
+                log(f"⚠️ No available profiles found for {alias}")
+                return
+
+            # Select the highest-ranked codec actually supported.
+            best_profile = None
+
+            for rank_profile, rank_codec in AudioPolicy.PROFILE_RANKING:
+                candidates = (
+                    f"{rank_profile}-{rank_codec}",
+                    f"{rank_profile}-{rank_codec.replace('-', '_')}",
+                )
+
+                for candidate in candidates:
+                    if candidate in supported_profiles:
+                        best_profile = candidate
+                        break
+
+                if best_profile:
+                    break
+
+            # If no ranked codec matched, retain the base A2DP profile
+            # only if the device actually provides it.
+            if not best_profile:
+                for rank_profile, _ in AudioPolicy.PROFILE_RANKING:
+                    if rank_profile in supported_profiles:
+                        best_profile = rank_profile
+                        break
+
+            if not best_profile:
+                log(f"⚠️ No supported ranked profile found for {alias}")
+                return
+
+            # 5. Apply the selected profile.
+            param_value = f'{{ name = "{best_profile}" }}'
+
+            subprocess.run(
+                [
+                    "pw-cli",
+                    "set-param",
+                    str(device_id),
+                    "Profile",
+                    param_value
+                ],
+                check=True,
+                capture_output=True
+            )
+
+            log(
+                f"🎧 Policy Enforced: Set '{best_profile}' on {alias}"
+            )
+
+        except Exception as e:
+            log(f"❌ Hardware optimization skipped: {e}")
+
+    @classmethod
+    def prepare_failover(cls, device):
+        sink = cls.graph.find_bluetooth_sink(device.alias)
+        if not sink:
+            return
+
+        failing_node_id = sink.get_id()
+        log(f"⚠️ Preparing migration away from unstable sink node {failing_node_id}")
+
+        fallback_sink = None
+        for node in cls.graph.nodes.values():
+            props = node.get_property("properties")
+            if not props: continue
+
+            is_sink = props.get("media.class") == "Audio/Sink"
+            has_dev = "device.id" in props
+            is_different = node.get_id() != failing_node_id
+
+            if is_sink and has_dev and is_different:
+                if "bluez" not in (props.get("device.api") or ""):
+                    fallback_sink = node
+                    break
+                elif not fallback_sink:
+                    fallback_sink = node
+
+        if not fallback_sink:
+            log("Migration aborted: No alternative physical hardware target found.")
+            return
+
+        fallback_props = fallback_sink.get_property("properties")
+        if not fallback_props:
+            return
+
+        fallback_name = fallback_props.get("node.name")
+        streams = cls.graph.list_audio_streams()
+
+        if not fallback_name:
+            return
+
+        # Natively Evacuate Targeted Sink Inputs via pw-metadata
+        for stream in streams:
+            try:
+                stream_props = stream.get_property("properties")
+                if not stream_props: continue
+
+                stream_id = stream.get_id()
+                subprocess.run([
+                    "pw-metadata", str(stream_id), "target.node", fallback_name
+                ], check=True, capture_output=True)
+                log(f"🎯 Redirected stream {stream_id} ({stream_props.get('node.name')}) → {fallback_name}")
+            except Exception as e:
+                log(f"Failed migrating stream context: {e}")
+
+# ---------------------------------------------------------
+# Bluetooth Infrastructure
+# ---------------------------------------------------------
+def attempt_connection(device):
+    if device.path in pending_connections or not device.trusted or device.connected:
+        return
+
+    obj = bus.get_object("org.bluez", device.path)
+    iface = dbus.Interface(obj, "org.bluez.Device1")
+    pending_connections.add(device.path)
+    log("🔄 Auto-connecting trusted device:", device.alias)
+
+    def on_connect_success():
+        pending_connections.discard(device.path)
+        log(f"✅ Auto-connect command accepted for {device.alias}")
+
+    def on_connect_error(error):
+        pending_connections.discard(device.path)
+
+        error_name = (
+            error.get_dbus_name()
+            if hasattr(error, "get_dbus_name")
+            else str(error)
+        )
+
+        if error_name == "org.bluez.Error.InProgress":
+            log(f"⏳ Connection already in progress: {device.alias}")
+        elif error_name == "org.bluez.Error.Failed":
+            log(f"📡 Device unavailable: {device.alias}")
+        else:
+            log(f"❌ Auto-connect failed for {device.alias}: {error_name}")
+
+    iface.Connect(
+        reply_handler=on_connect_success,
+        error_handler=on_connect_error
+    )
+
+class Rejected(dbus.DBusException):
+    _dbus_error_name = "org.bluez.Error.Rejected"
+
+class Agent(dbus.service.Object):
+    @dbus.service.method(AGENT_INTERFACE, in_signature="os", out_signature="")
+    def AuthorizeService(self, device, uuid):
+        log(f"🔑 Auto-authorizing service {uuid} for {device}")
+        return
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="s")
+    def RequestPinCode(self, device):
+        log(f"🔑 Auto-providing default PIN '0000' for {device}")
+        return "0000"
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="u")
+    def RequestPasskey(self, device):
+        log(f"🔑 Auto-providing default passkey '0' for {device}")
+        return dbus.UInt32(0)
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="ou", out_signature="")
+    def RequestConfirmation(self, device, passkey):
+        log(f"🔑 Auto-confirming passkey {passkey} for {device}")
+        return
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="o", out_signature="")
+    def RequestAuthorization(self, device):
+        log(f"🔑 Auto-authorizing connection for {device}")
+        return
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="os", out_signature="")
+    def DisplayPinCode(self, device, pincode):
+        log(f"👀 Device {device} displaying PIN: {pincode} (Headless: ignoring)")
+        return
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="ouq", out_signature="")
+    def DisplayPasskey(self, device, passkey, entered):
+        log(f"👀 Device {device} displaying Passkey: {passkey} (Headless: ignoring)")
+        return
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="", out_signature="")
+    def Cancel(self):
+        log("⚠️ Agent request canceled by BlueZ")
+
+    @dbus.service.method(AGENT_INTERFACE, in_signature="", out_signature="")
+    def Release(self):
+        log("🧹 Agent released by BlueZ")
+        if not DAEMON: 
+            loop.quit()
+
+def properties_changed(interface, changed, invalidated, path):
+    if interface == "org.bluez.Device1":
+        DeviceRegistry.get(path).update(changed)
+
+def interfaces_removed(path, interfaces):
+    """Catches when a device is completely removed (e.g., unpaired)."""
+    if "org.bluez.Device1" in interfaces:
+        DeviceRegistry.remove(path)
+
+def load_existing_devices():
+    manager = dbus.Interface(bus.get_object("org.bluez", "/"), "org.freedesktop.DBus.ObjectManager")
+    for path, interfaces in manager.GetManagedObjects().items():
+        if "org.bluez.Device1" in interfaces:
+            DeviceRegistry.get(path).update(interfaces["org.bluez.Device1"])
+
+def connect_trusted_devices():
+    for device in DeviceRegistry.all():
+        if device.trusted and not device.connected:
+            attempt_connection(device)
+
+# ---------------------------------------------------------
+# Main Runtime Loop Lifecycle
+# ---------------------------------------------------------
+def main():
+    global VERBOSE, DAEMON, bus
+
+    try:
+        opts, _ = getopt.getopt(sys.argv[1:], "dv", ["daemon", "verbose"])
+        for o, _ in opts:
+            if o in ("-d", "--daemon"): DAEMON = True
+            elif o in ("-v", "--verbose"): VERBOSE = True
+    except getopt.GetoptError as err:
+        print(f"Argument error: {err}")
+        sys.exit(2)
+
+    DBusGMainLoop(set_as_default=True)
+    AudioManager.initialize()
+    bus = dbus.SystemBus()
+
+    Agent(bus, AGENT_PATH)
+    manager = dbus.Interface(
+        bus.get_object("org.bluez", "/org/bluez"),
+        "org.bluez.AgentManager1"
+    )
+
+    try:
+        manager.RegisterAgent(AGENT_PATH, "NoInputNoOutput")
+        manager.RequestDefaultAgent(AGENT_PATH)
+    except dbus.exceptions.DBusException as e:
+        error_name = e.get_dbus_name()
+
+        if error_name == "org.bluez.Error.AlreadyExists":
+            print("❌ FATAL: Another Bluetooth agent is already running.")
+            print("Please stop the existing agent (e.g., bluetoothctl) before running this script.")
+        else:
+            print(f"❌ FATAL: Failed to register BlueZ agent: {e}")
+
+        sys.exit(1)
+
+    bus.add_signal_receiver(
+        properties_changed,
+        bus_name="org.bluez",
+        dbus_interface="org.freedesktop.DBus.Properties",
+        signal_name="PropertiesChanged",
+        path_keyword="path"
+    )
+
+    bus.add_signal_receiver(
+        interfaces_removed,
+        bus_name="org.bluez",
+        dbus_interface="org.freedesktop.DBus.ObjectManager",
+        signal_name="InterfacesRemoved",
+    )
+
+    load_existing_devices()
+    connect_trusted_devices()
+
+    GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGINT, loop.quit)
+    GLibUnix.signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, loop.quit)
+
+    log("bluetooth-autoconnect v3 engine live")
+    loop.run()
+
+if __name__ == "__main__":
+    main()
