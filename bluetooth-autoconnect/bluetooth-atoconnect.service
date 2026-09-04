@@ -1,0 +1,16 @@
+[Unit]
+Description=Bluetooth Autoconnect and Audio Health Service
+After=dbus.service pipewire.service wireplumber.service bluetooth.service bluetooth.target
+Wants=dbus.service pipewire.service wireplumber.service bluetooth.service bluetooth.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /usr/local/bin/bluetooth-autoconnect --verbose
+Restart=on-failure
+RestartSec=5
+Nice=-10
+LimitNICE=-10
+SyslogIdentifier=bluetooth-autoconnect
+
+[Install]
+WantedBy=default.target
