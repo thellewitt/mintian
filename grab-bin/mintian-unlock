@@ -1,0 +1,94 @@
+#!/usr/bin/env bash
+# mintian-unlock: Force-removes stale .lock files left by crashed package operations
+# Author: Triala Boomdeay (Goddess of The Netherverse)
+# Version: 2.2
+
+LOCK_FILES=(
+    "/etc/.git/HEAD.lock"
+    "/etc/.git/index.lock"
+    "/etc/.git/refs/heads/master.lock"
+    "/etc/.git/logs/HEAD.lock"
+    "/etc/.git/logs/refs/heads/master.lock"
+    "/var/cache/apt/archives/lock"
+    "/var/lib/apt/daily_lock"
+    "/var/lib/apt/lists/lock"
+    "/var/lib/dpkg/lock"
+    "/var/lib/dpkg/lock-frontend"
+    "/var/lib/dpkg/triggers/Lock"
+    "/var/lock/aptitude"
+    "/root/.config/synaptic/lock"
+)
+
+LOG_FILE="/var/log/mintian/mintian-unlock.log"
+DRY_RUN=false
+FORCE=false
+
+timestamp() {
+    date +"%Y-%m-%d %H:%M:%S"
+}
+
+log() {
+    mkdir -p "$(dirname "$LOG_FILE")"
+    echo "$(timestamp) $1" | tee -a "$LOG_FILE"
+}
+
+# Trap Ctrl-C and termination signals to log interruption
+trap 'log "⚠️ mintian-unlock interrupted"; exit 130' SIGINT SIGTERM
+
+check_running() {
+    local found=false
+    for proc in apt dpkg synaptic; do
+        if pgrep -x "$proc" > /dev/null; then
+            log "⚠️ Process '$proc' is running. Unlocking now may cause damage."
+            found=true
+        fi
+    done
+    $found && return 1 || return 0
+}
+
+usage() {
+    echo "Usage: $0 [--dry-run] [--force]" >&2
+    echo "  --dry-run   Show which files *would* be removed" >&2
+    echo "  --force     Skip process checks (dangerous!)" >&2
+    exit 1
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --dry-run) DRY_RUN=true ;;
+            --force)   FORCE=true ;;
+            *)         usage ;;
+        esac
+        shift
+    done
+}
+
+run_unlock() {
+    log "🧹 Starting mintian-unlock (dry-run=$DRY_RUN, force=$FORCE)"
+    
+    if ! $FORCE; then
+        check_running || { log "🔒 Aborting due to active package managers."; exit 2; }
+    fi
+
+    for file in "${LOCK_FILES[@]}"; do
+        if [[ -f "$file" ]]; then
+            if $DRY_RUN; then
+                log "Would remove: $file"
+            else
+                log "Removing: $file"
+                rm -f "$file" || log "❌ Failed to remove: $file"
+            fi
+        fi
+    done
+
+    log "✅ Done."
+}
+
+main() {
+    [[ "$EUID" -ne 0 ]] && echo "Please run as root." >&2 && exit 1
+    parse_args "$@"
+    run_unlock
+}
+
+main "$@"
