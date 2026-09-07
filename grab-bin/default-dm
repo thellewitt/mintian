@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Robust display manager configuration script for Debian/Ubuntu systems
+
+set -euo pipefail
+
+DEFAULT_DM="/etc/X11/default-display-manager"
+
+echo "Please choose a display manager:"
+echo "1) sddm"
+echo "2) gdm3"
+echo "3) lightdm"
+echo "4) lxdm"
+echo "5) xdm"
+
+read -r -p "Enter the number corresponding to your choice: [3]: " choice
+choice="${choice:-3}"
+
+case "$choice" in
+    1) chosen_dm="/usr/sbin/sddm";   package="sddm" ;;
+    2) chosen_dm="/usr/sbin/gdm3";   package="gdm3" ;;
+    3) chosen_dm="/usr/sbin/lightdm"; package="lightdm" ;;
+    4) chosen_dm="/usr/sbin/lxdm";   package="lxdm" ;;
+    5) chosen_dm="/usr/sbin/xdm";    package="xdm" ;;
+    *)
+        echo "Invalid choice. Defaulting to lightdm." >&2
+        chosen_dm="/usr/sbin/lightdm"
+        package="lightdm"
+        ;;
+esac
+
+if [[ ! -x "$chosen_dm" ]]; then
+    echo "Error: $chosen_dm is not installed or is not executable." >&2
+    exit 1
+fi
+
+echo "$chosen_dm" | sudo tee "$DEFAULT_DM" > /dev/null
+
+echo "Successfully updated $DEFAULT_DM with: $chosen_dm"
+echo "Reconfiguring $package..."
+
+sudo dpkg-reconfigure -plow "$package"
+
+echo "Display manager configuration complete."
